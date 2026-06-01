@@ -195,7 +195,7 @@ class PyannoteDiarizationEngine(BaseDiarizationEngine):
             "waveform": torch.from_numpy(audio[None, :]),
             "sample_rate": SAMPLE_RATE,
         }
-        diarization_pipeline = Pipeline.from_pretrained(checkpoint_path, use_auth_token=use_auth_token).to(device)
+        diarization_pipeline = Pipeline.from_pretrained(checkpoint_path, token=use_auth_token).to(device)
 
         # Adapter that translates pyannote's hook protocol
         # (step_name, step_artifact, file, total, completed) into the unified
@@ -218,8 +218,9 @@ class PyannoteDiarizationEngine(BaseDiarizationEngine):
             max_speakers=max_speakers,
             hook=_pyannote_hook if on_progress is not None else None,
         )
+        annotation = diarization.speaker_diarization if hasattr(diarization, 'speaker_diarization') else diarization
         diarization_df = pd.DataFrame(
-            diarization.itertracks(yield_label=True),
+            annotation.itertracks(yield_label=True),
             columns=["segment", "label", "speaker"],
         )
         diarization_df["start"] = diarization_df["segment"].apply(lambda x: x.start)
