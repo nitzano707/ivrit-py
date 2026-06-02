@@ -92,6 +92,7 @@ class PyannoteDiarizationEngine(BaseDiarizationEngine):
         Returns:
             The speaker ID with the highest intersection, or None if no match found
         """
+        import numpy as np
         # Calculate intersection and union
         diarization_df["intersection"] = np.minimum(diarization_df["end"], end) - np.maximum(diarization_df["start"], start)
         diarization_df["union"] = np.maximum(diarization_df["end"], end) - np.minimum(diarization_df["start"], start)
