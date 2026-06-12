@@ -1,5 +1,4 @@
 <div dir=rtl>
-
 ## הקבצים ששונו
 
 ### 1. `diarization.py`
