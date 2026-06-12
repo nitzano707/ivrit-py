@@ -1,0 +1,2005 @@
+"""
+Audio transcription functionality for ivrit.ai
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import concurrent.futures
+import json
+import logging
+import os
+import time
+import io
+import wave
+from abc import ABC, abstractmethod
+from typing import Any, AsyncGenerator, Generator, Optional, Union, List, Dict
+from uuid import uuid4
+
+import aiohttp
+import requests
+
+from . import utils
+from .types import Segment, Word
+from .utils import ProgressCallback, emit_progress, invoke_progress
+
+logger = logging.getLogger(__name__)
+
+
+def _copy_segment_extra_data(segment, language: Optional[str] = None) -> dict:
+    """
+    Copy extra data from a segment object, filtering out bound methods and other non-value attributes.
+    
+    Args:
+        segment: The segment object to extract data from
+        language: Optional language override
+    
+    Returns:
+        Dictionary containing the extra data
+    """
+    extra_data = {}
+    
+    # Add all segment attributes to extra_data, filtering out non-serializable attributes
+    for attr_name in dir(segment):
+        if not attr_name.startswith('_') and attr_name not in ['text', 'start', 'end', 'words']:
+            try:
+                attr_value = getattr(segment, attr_name)
+                # Test if the attribute is serializable by trying to convert to JSON
+                json.dumps(attr_value)
+                extra_data[attr_name] = attr_value
+            except (TypeError, ValueError):
+                # Skip non-serializable attributes
+                pass
+            except Exception:
+                # Skip attributes that can't be accessed
+                pass
+       
+    return extra_data
+
+
+class TranscriptionSession(ABC):
+    """
+    Abstract base class for incremental transcription sessions.
+    
+    A session maintains state for incremental audio processing, allowing users
+    to add audio frames and get new segments with confidence scores.
+    """
+    
+    def __init__(self, session_id: str, model: 'TranscriptionModel'):
+        """
+        Initialize a transcription session.
+        
+        Args:
+            session_id: Unique identifier for this session
+            model: The transcription model to use
+        """
+        self.session_id = session_id
+        self.model = model
+    
+    @abstractmethod
+    def append(self, audio_bytes: bytes) -> None:
+        """
+        Add audio to the session and update internal state. Does not return segments.
+
+        The input should be raw mono 16-bit PCM bytes (s16le) at the session's sample_rate.
+
+        Args:
+            audio_bytes: Audio payload as raw PCM s16le bytes
+        """
+        pass
+    
+    @abstractmethod
+    def get_all_segments(self) -> List[Segment]:
+        """
+        Get all segments accumulated in this session.
+        
+        Returns:
+            List of all segments in the session
+        """
+        pass
+    
+    @abstractmethod
+    def get_full_text(self) -> str:
+        """
+        Get the full transcribed text from all segments.
+        
+        Returns:
+            Combined text from all segments
+        """
+        pass
+    
+    @abstractmethod
+    def get_session_info(self) -> Dict[str, Any]:
+        """
+        Get information about this session.
+        
+        Returns:
+            Dictionary containing session metadata
+        """
+        pass
+    
+    @abstractmethod
+    def reset(self):
+        """Reset the session buffer and clear all state."""
+        pass
+    
+    @abstractmethod
+    def flush(self) -> List[Segment]:
+        """
+        Flush the session and return any remaining segments including the final one.
+        
+        This method should be called at the end of audio processing to get the
+        final segment(s) that may not have been returned by append() due to
+        confidence filtering.
+        
+        Returns:
+            List of remaining segments including the final one
+        """
+        pass
+
+
+class TranscriptionModel(ABC):
+    """Base class for transcription models"""
+    
+    def __init__(self, engine: str, model: str, model_object: Any = None):
+        self.engine = engine
+        self.model = model
+        self.model_object = model_object
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(engine='{self.engine}', model='{self.model}')"
+    
+    def create_session(self, language: Optional[str] = None, sample_rate: int = 16000, 
+                      verbose: bool = False) -> TranscriptionSession:
+        """
+        Create a new transcription session for incremental audio processing.
+        
+        Args:
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            sample_rate: Audio sample rate (default: 16000 Hz)
+            verbose: Whether to enable verbose output
+            
+        Returns:
+            TranscriptionSession object for incremental transcription
+            
+        Raises:
+            NotImplementedError: If the model doesn't support session-based transcription
+        """
+        raise NotImplementedError(f"Session-based transcription is not supported for {self.engine} engine. "
+                                f"Only some specific models support sessions.")
+    
+
+    
+    def transcribe(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        stream: bool = False,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Union[dict, Generator]:
+        """
+        Transcribe audio using this model.
+
+        Args:
+            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
+            url: URL to download and transcribe (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            stream: Whether to return results as a generator (True) or full result (False)
+            diarize: Whether to enable speaker diarization
+            diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
+            output_options: Dictionary controlling output verbosity. Supported keys:
+                - word_timestamps (bool): Whether to populate word-level timestamps (default: True)
+                - extra_data (bool): Whether to populate extra metadata fields (default: True)
+            verbose: Whether to enable verbose output
+            on_progress: Optional callback invoked periodically as work
+                advances. Receives a dict with the following core keys:
+                  - 'phase': str, either 'transcription' or 'diarization'.
+                    A single callback may be invoked with both values when a
+                    transcribe-then-diarize run is in progress; events are
+                    emitted in phase order.
+                  - 'step': str — a sub-phase label such as 'decode',
+                    'embedding', or 'clustering'.
+                  - 'step_fraction': float — 0.0 to 1.0, progress within the
+                    current step. 0.0 when the engine cannot compute it.
+                  - 'description': str — short human-readable label suitable
+                    for a UI progress indicator.
+                  - 'extra': dict — engine-specific data (e.g.
+                    'processed_seconds', 'total_seconds', 'segment_index',
+                    'clusters_tried'). May be empty.
+                Exceptions raised by the callback are caught and logged at
+                warning level.
+            **kwargs: Additional keyword arguments for the transcription model.
+        Returns:
+            If stream=True: Generator yielding transcription segments
+            If stream=False: Complete transcription result as dictionary
+            
+        Raises:
+            ValueError: If multiple input sources are provided, or none is provided
+            FileNotFoundError: If the specified path doesn't exist
+            Exception: For other transcription errors
+        """
+        # Validate arguments
+        provided_args = [arg for arg in [path, url, blob] if arg is not None]
+        if len(provided_args) > 1:
+            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
+        
+        if len(provided_args) == 0:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        # Validate streaming with diarization
+        if stream and diarize:
+            raise ValueError("Streaming (stream=True) is not compatible with diarization (diarize=True). Diarization requires processing all segments before speaker assignment.")
+
+        # Default output options if not provided
+        if output_options is None:
+            output_options = {}
+        
+        # Set defaults for output options
+        output_options = {
+            'word_timestamps': output_options.get('word_timestamps', True),
+            'extra_data': output_options.get('extra_data', True),
+        }
+
+        # Get streaming results from the model
+        segments_generator = self.transcribe_core(path=path, url=url, blob=blob, language=language, diarize=diarize, diarization_args=diarization_args, output_options=output_options, verbose=verbose, on_progress=on_progress, **kwargs)
+        
+        if stream:
+            # Return generator directly
+            return segments_generator
+        else:
+            # Collect all segments and return as dictionary
+            segments = list(segments_generator)
+            if not segments:
+                return {
+                    "text": "",
+                    "segments": [],
+                    "language": language or "unknown",
+                    "engine": self.engine,
+                    "model": self.model
+                }
+            
+            # Combine all text
+            full_text = " ".join(segment.text for segment in segments)
+            
+            transcription_results = {
+                "text": full_text,
+                "segments": segments,
+                "language": segments[0].extra_data.get("language", language or "unknown"),
+                "engine": self.engine,
+                "model": self.model
+            }
+
+            return transcription_results
+    
+    @abstractmethod
+    def transcribe_core(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Dict[str, Any],
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Generator[Segment, None, None]:
+        """
+        Core transcription method that must be implemented by derived classes.
+
+        Args:
+            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
+            url: URL to download and transcribe (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            language: Language code for transcription
+            diarize: Whether to enable speaker diarization
+            diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
+            output_options: Dictionary controlling output verbosity (word_timestamps, extra_data)
+            verbose: Whether to enable verbose output
+            on_progress: Optional progress callback. See TranscriptionModel.transcribe.
+            **kwargs: Additional keyword arguments for the transcription model.
+
+        Returns:
+            Generator yielding Segment objects
+        """
+
+    async def transcribe_async(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> AsyncGenerator[Segment, None]:
+        """
+        Transcribe audio using this model asynchronously.
+
+        Runs the transcription in a thread pool to allow other coroutines to continue.
+
+        Args:
+            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
+            url: URL to download and transcribe (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            diarize: Whether to enable speaker diarization
+            diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
+            output_options: Dictionary controlling output verbosity. Supported keys:
+                - word_timestamps (bool): Whether to populate word-level timestamps (default: True)
+                - extra_data (bool): Whether to populate extra metadata fields (default: True)
+            verbose: Whether to enable verbose output
+            on_progress: Optional progress callback. See TranscriptionModel.transcribe.
+                When the user-supplied callback may be invoked from a worker
+                thread (default async impl), it must be thread-safe.
+            **kwargs: Additional keyword arguments for the transcription model.
+        Returns:
+            AsyncGenerator yielding transcription segments
+            
+        Raises:
+            ValueError: If multiple input sources are provided, or none is provided
+            FileNotFoundError: If the specified path doesn't exist
+            Exception: For other transcription errors
+        """
+        # Validate arguments
+        provided_args = [arg for arg in [path, url, blob] if arg is not None]
+        if len(provided_args) > 1:
+            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
+        
+        if len(provided_args) == 0:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        # Default output options if not provided
+        if output_options is None:
+            output_options = {}
+        
+        # Set defaults for output options
+        output_options = {
+            'word_timestamps': output_options.get('word_timestamps', True),
+            'extra_data': output_options.get('extra_data', True),
+        }
+
+        # Define the synchronous function to run in thread
+        def run_transcription():
+            return list(self.transcribe_core(
+                path=path, url=url, blob=blob, language=language,
+                diarize=diarize, diarization_args=diarization_args,
+                output_options=output_options, verbose=verbose,
+                on_progress=on_progress, **kwargs
+            ))
+        
+        # Run transcription in thread pool to allow other coroutines to continue
+        loop = asyncio.get_event_loop()
+        segments = await loop.run_in_executor(None, run_transcription)
+        
+        # Yield segments
+        for segment in segments:
+            yield segment
+
+
+def get_device_and_index(device: str) -> tuple[str, Optional[int]]:
+    """
+    Parse device string to extract device type and index.
+    
+    Args:
+        device: Device string (e.g., "cuda", "cuda:0", "cpu")
+        
+    Returns:
+        Tuple of (device_type, device_index)
+    """
+    if ":" in device:
+        device_type, index_str = device.split(":", 1)
+        return device_type, int(index_str)
+    else:
+        return device, None
+
+
+class WhisperSession(TranscriptionSession):
+    """
+    Concrete session implementation for transcription models.
+    
+    Manages incremental audio processing with confidence tracking for whisper-based engines.
+    """
+    
+    def __init__(self, session_id: str, model: TranscriptionModel, language: Optional[str] = None, 
+                 sample_rate: int = 16000, verbose: bool = True):
+        """
+        Initialize a whisper transcription session.
+        
+        Args:
+            session_id: Unique identifier for this session
+            model: The TranscriptionModel to use
+            language: Language code for transcription
+            sample_rate: Audio sample rate (default: 16000 Hz)
+            verbose: Whether to enable verbose output
+        """
+        super().__init__(session_id, model)
+        self.language = language
+        self.sample_rate = sample_rate
+        self.verbose = verbose
+        
+        # Audio buffer for incremental processing (raw PCM s16le bytes)
+        self.pcm_bytes_buffer = bytearray()
+        
+        # Track accumulated segments
+        self.accumulated_segments: List[Segment] = []
+        
+        # Session metadata
+        self.total_frames_added = 0
+        self.total_duration = 0.0
+    
+    def append(self, audio_bytes: bytes) -> None:
+        """
+        Add audio to the session and update internal state. Does not return segments.
+
+        Accepts raw mono 16-bit PCM bytes (s16le) at the session's sample_rate.
+        """
+        if not audio_bytes:
+            return
+
+        # Validate PCM s16le input
+        if len(audio_bytes) % 2 != 0:
+            raise ValueError("PCM bytes length must be even (16-bit samples)")
+        
+        # Add raw PCM s16le to buffer
+        self.pcm_bytes_buffer.extend(audio_bytes)
+        self.total_frames_added += len(audio_bytes) // 2
+        
+        # Update duration
+        self.total_duration = len(self.pcm_bytes_buffer) / (2 * self.sample_rate)
+
+        if self.verbose:
+            logger.info(
+                f"Session {self.session_id}: Added {len(audio_bytes)} bytes, "
+                f"total duration: {self.total_duration:.2f}s"
+            )
+
+        # Process buffer to extract any complete segments and accumulate them
+        complete_segments = self._transcribe_buffered(flush=False)
+        if complete_segments:
+            self.accumulated_segments.extend(complete_segments)
+            if self.verbose:
+                logger.info(
+                    f"Session {self.session_id}: Found {len(complete_segments)} complete segments"
+                )
+    
+    def get_all_segments(self) -> List[Segment]:
+        """
+        Get all segments accumulated in this session.
+        
+        Returns:
+            List of all segments in the session
+        """
+        return self.accumulated_segments.copy()
+    
+    def get_full_text(self) -> str:
+        """
+        Get the full transcribed text from all segments.
+        
+        Returns:
+            Combined text from all segments
+        """
+        return " ".join(segment.text for segment in self.accumulated_segments)
+    
+    def get_session_info(self) -> Dict[str, Any]:
+        """
+        Get information about this session.
+        
+        Returns:
+            Dictionary containing session metadata
+        """
+        return {
+            "session_id": self.session_id,
+            "total_frames": self.total_frames_added,
+            "total_duration": self.total_duration,
+            "total_segments": len(self.accumulated_segments),
+            "sample_rate": self.sample_rate,
+            "language": self.language,
+            "engine": self.model.engine,
+            "model": self.model.model
+        }
+    
+    def reset(self):
+        """Reset the session buffer and clear all state."""
+        self.pcm_bytes_buffer = bytearray()
+        self.accumulated_segments = []
+        self.total_frames_added = 0
+        self.total_duration = 0.0
+        
+        if self.verbose:
+            logger.info(f"Session {self.session_id}: Reset")
+    
+    def flush(self) -> List[Segment]:
+        """
+        Flush the session and return any remaining segments including the final one.
+        
+        This method should be called at the end of audio processing to get the
+        final segment(s) that may not have been returned by append() due to
+        confidence filtering.
+        
+        Returns:
+            List of remaining segments including the final one
+        """
+        if len(self.pcm_bytes_buffer) == 0:
+            return []
+        
+        # Get any remaining segments (handles buffer clearing internally)
+        remaining_segments = self._transcribe_buffered(flush=True)
+        
+        # Add remaining segments to accumulated and return them
+        if remaining_segments:
+            self.accumulated_segments.extend(remaining_segments)
+            
+            if self.verbose:
+                logger.info(f"Session {self.session_id}: Flushed {len(remaining_segments)} final segments")
+            
+            return remaining_segments
+        
+        return []
+    
+    def _transcribe_buffered(self, flush: bool = False) -> List[Segment]:
+        """
+        Transcribe the current audio buffer using the model and handle buffer trimming.
+        
+        Uses the model's transcribe_core method to get Segment objects without looking
+        at model internals, providing a unified implementation across all model types.
+        
+        Args:
+            flush: If True, return all segments and clear the buffer.
+                   If False, return complete segments and trim the buffer.
+        
+        Returns:
+            List of transcription segments based on flush parameter
+        """
+        if len(self.pcm_bytes_buffer) == 0:
+            return []
+        
+        # Skip if buffer is too short (less than 0.5 seconds), unless flushing
+        min_bytes = int(0.5 * self.sample_rate) * 2  # 16-bit mono => 2 bytes per sample
+        if not flush and len(self.pcm_bytes_buffer) < min_bytes:
+            return []
+        
+        # Create in-memory WAV buffer from raw PCM bytes
+        wav_buffer = io.BytesIO()
+        
+        try:
+            # Create WAV data in memory
+            with wave.open(wav_buffer, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(bytes(self.pcm_bytes_buffer))
+            
+            # Get WAV bytes and convert to base64 blob for all models
+            # This eliminates temporary file creation and uses utils.get_audio_file_path blob handling
+            wav_bytes = wav_buffer.getvalue()
+            import base64
+            wav_blob = base64.b64encode(wav_bytes).decode('utf-8')
+            
+            # Use the model's transcribe_core method with blob for all model types
+            # This works uniformly since all models support blob via utils.get_audio_file_path
+            all_segments = list(self.model.transcribe_core(
+                blob=wav_blob,
+                language=self.language,
+                verbose=self.verbose
+            ))
+            
+            # Handle buffer trimming and segment filtering based on flush parameter
+            if flush:
+                # When flushing, clear the buffer and return all segments
+                self.pcm_bytes_buffer = bytearray()
+                return all_segments
+            else:
+                # For regular processing, return complete segments and trim buffer
+                if len(all_segments) > 1:
+                    # All segments except the last are considered complete/high-confidence
+                    complete_segments = all_segments[:-1]
+                    
+                    # Trim the buffer: remove audio up to the end of the last complete segment
+                    last_complete_end_time = complete_segments[-1].end
+                    samples_to_remove = int(last_complete_end_time * self.sample_rate)
+                    bytes_to_remove = samples_to_remove * 2
+                    
+                    if bytes_to_remove > 0 and bytes_to_remove < len(self.pcm_bytes_buffer):
+                        self.pcm_bytes_buffer = self.pcm_bytes_buffer[bytes_to_remove:]
+                        
+                        if self.verbose:
+                            logger.info(f"Session {self.session_id}: Trimmed {samples_to_remove} samples ({last_complete_end_time:.2f}s)")
+                    
+                    return complete_segments
+                else:
+                    # No complete segments yet (0 or 1 segments)
+                    return []
+            
+        except Exception as e:
+            logger.error(f"Error during session buffer transcription: {e}")
+            return []
+        finally:
+            # Close the WAV buffer
+            wav_buffer.close()
+
+
+class FasterWhisperModel(TranscriptionModel):
+    """Faster Whisper transcription model"""
+    
+    def __init__(self, model: str, device: str = None, local_files_only: bool = False, **kwargs):
+        super().__init__(engine="faster-whisper", model=model)
+        
+        # Check for required dependencies
+        utils.check_dependencies(['faster_whisper', 'numpy'], 'FasterWhisperModel')
+        
+        self.model_path = model
+        self.device = device if device else utils.guess_device()
+        self.local_files_only = local_files_only
+        self.model_kwargs = kwargs
+        
+        # Load the model immediately
+        self.model_object = self._load_faster_whisper_model()
+    
+    def _load_faster_whisper_model(self) -> Any:
+        """
+        Load the actual faster-whisper model.
+        """
+        # Import faster_whisper
+        import faster_whisper
+        
+        device_index = None
+        
+        if len(self.device.split(",")) > 1:
+            device_indexes = []
+            base_device = None
+            for device_instance in self.device.split(","):
+                device, device_index = get_device_and_index(device_instance)
+                base_device = base_device or device
+                if base_device != device:
+                    raise ValueError("Multiple devices must be instances of the same base device (e.g cuda:0, cuda:1 etc.)")
+                device_indexes.append(device_index)
+            device = base_device
+            device_index = device_indexes
+        else:
+            device, device_index = get_device_and_index(self.device)
+        
+        args = {'device': device}
+        if device_index:
+            args['device_index'] = device_index
+        if self.local_files_only:
+            args['local_files_only'] = self.local_files_only
+        
+        # Set default compute_type based on device if not provided by user.
+        # We have seen cases where transcription accuracy degrades when using int8.
+        if 'compute_type' not in self.model_kwargs:
+            args['compute_type'] = 'float16' if device == 'cuda' else 'float32'
+        
+        # Add any additional kwargs passed to the constructor
+        args.update(self.model_kwargs)
+        
+        logger.info(f'Loading faster-whisper model: {self.model_path} on {device} with index: {device_index or 0}')
+        return faster_whisper.WhisperModel(self.model_path, **args)
+    
+    def create_session(self, language: Optional[str] = None, sample_rate: int = 16000, 
+                      verbose: bool = False) -> TranscriptionSession:
+        """
+        Create a new transcription session for incremental audio processing.
+        
+        Args:
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            sample_rate: Audio sample rate (default: 16000 Hz)
+            verbose: Whether to enable verbose output
+            
+        Returns:
+            WhisperSession object for incremental transcription
+        """
+        session_id = str(uuid4())
+        session = WhisperSession(
+            session_id=session_id,
+            model=self,
+            language=language,
+            sample_rate=sample_rate,
+            verbose=verbose
+        )
+        
+        if verbose:
+            logger.info(f"Created FasterWhisper transcription session: {session_id}")
+        
+        return session
+
+    def transcribe_core(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Dict[str, Any],
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Generator[Segment, None, None]:
+        """
+        Transcribe using faster-whisper engine.
+        """
+        # Validate diarization support
+        if diarize:
+            raise NotImplementedError("Diarization (diarize=True) is only supported with StableWhisper models. "
+                                    "Please use StableWhisperModel or RunPodModel with core_engine='stable-whisper'.")
+
+        # Handle URL download or blob processing if needed
+        audio_path = utils.get_audio_file_path(path=path, url=url, blob=blob, verbose=verbose)
+
+        if verbose:
+            logger.info(f"Using faster-whisper engine with model: {self.model}")
+            logger.info(f"Processing file: {audio_path}")
+            if self.model_object:
+                logger.info(f"Using pre-loaded model: {self.model_object}")
+            if diarize:
+                logger.info("Diarization is enabled")
+
+        try:
+            # Transcribe using faster-whisper directly with file path
+            # Enable word timestamps if requested
+            segments, info = self.model_object.transcribe(audio_path, language=language, word_timestamps=output_options['word_timestamps'])
+            total_seconds = getattr(info, "duration", None)
+
+            # Collect segments for diarization if needed
+            all_segments = [] if diarize else None
+
+            for segment in segments:
+                # Build extra_data dictionary if requested
+                segment_extra_data = _copy_segment_extra_data(segment, language=language) if output_options['extra_data'] else {}
+
+                # Process words if available and requested
+                segment_words = []
+                if output_options['word_timestamps'] and hasattr(segment, 'words') and segment.words:
+                    for word_data in segment.words:
+                        word = Word(
+                            word=word_data.word,
+                            start=word_data.start,
+                            end=word_data.end,
+                            probability=getattr(word_data, 'probability', None)
+                        )
+                        segment_words.append(word)
+
+                # Create Segment object
+                segment_obj = Segment(
+                    text=segment.text,
+                    start=segment.start,
+                    end=segment.end,
+                    words=segment_words,
+                    extra_data=segment_extra_data
+                )
+
+                emit_progress(
+                    on_progress,
+                    phase="transcription",
+                    step="decode",
+                    step_fraction=segment.end / total_seconds if total_seconds else 0.0,
+                    description="Transcribing audio",
+                    processed_seconds=segment.end,
+                    total_seconds=total_seconds,
+                )
+
+                if diarize:
+                    all_segments.append(segment_obj)
+                else:
+                    yield segment_obj
+            
+            # Apply diarization if requested
+            if diarize:
+                from .diarization import diarize as diarize_func
+                
+                # Copy user diarization arguments and set defaults
+                diar_kwargs = (diarization_args or {}).copy()
+                diar_kwargs.setdefault("engine", "ivrit")
+                diar_kwargs.setdefault("device", self.device)
+                
+                all_segments = diarize_func(
+                    audio=audio_path,
+                    transcription_segments=all_segments,
+                    verbose=verbose,
+                    on_progress=on_progress,
+                    **diar_kwargs
+                )
+                
+                # Yield all segments
+                for segment in all_segments:
+                    yield segment
+                
+        except Exception as e:
+            logger.error(f"Error during transcription: {e}")
+            raise
+
+        finally:
+            # Clean up temporary files created for URL downloads or blob processing
+            if (url is not None or blob is not None) and os.path.exists(audio_path):
+                os.remove(audio_path)
+
+
+class StableWhisperModel(TranscriptionModel):
+    """Stable Whisper transcription model"""
+    
+    def __init__(self, model: str, device: str = None, local_files_only: bool = False, **kwargs):
+        super().__init__(engine="stable-whisper", model=model)
+        
+        # Check for required dependencies
+        utils.check_dependencies(['stable_whisper', 'numpy'], 'StableWhisperModel')
+        
+        self.model_path = model
+        self.device = device if device else utils.guess_device()
+        self.local_files_only = local_files_only
+        self.model_kwargs = kwargs
+        
+        # Load the model immediately
+        self.model_object = self._load_stable_whisper_model()
+    
+    def _load_stable_whisper_model(self) -> Any:
+        """
+        Load the actual stable-whisper model.
+        """
+        # Import stable_whisper
+        import stable_whisper
+        
+        device_index = None
+        
+        if len(self.device.split(",")) > 1:
+            device_indexes = []
+            base_device = None
+            for device_instance in self.device.split(","):
+                device, device_index = get_device_and_index(device_instance)
+                base_device = base_device or device
+                if base_device != device:
+                    raise ValueError("Multiple devices must be instances of the same base device (e.g cuda:0, cuda:1 etc.)")
+                device_indexes.append(device_index)
+            device = base_device
+            device_index = device_indexes
+        else:
+            device, device_index = get_device_and_index(self.device)
+        
+        args = {'device': device}
+        if device_index:
+            args['device_index'] = device_index
+        if self.local_files_only:
+            args['local_files_only'] = self.local_files_only
+        
+        # Set default compute_type based on device if not provided by user
+        # We have seen cases where transcription accuracy degrades when using int8.
+        if 'compute_type' not in self.model_kwargs:
+            args['compute_type'] = 'float16' if device == 'cuda' else 'float32'
+
+        # Add any additional kwargs passed to the constructor
+        args.update(self.model_kwargs)
+        
+        logger.info(f'Loading stable-whisper model: {self.model_path} on {device} with index: {device_index or 0}')
+        return stable_whisper.load_faster_whisper(self.model_path, **args)
+    
+    def create_session(self, language: Optional[str] = None, sample_rate: int = 16000, 
+                      verbose: bool = False) -> TranscriptionSession:
+        """
+        Create a new transcription session for incremental audio processing.
+        
+        Args:
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            sample_rate: Audio sample rate (default: 16000 Hz)
+            verbose: Whether to enable verbose output
+            
+        Returns:
+            WhisperSession object for incremental transcription
+        """
+        session_id = str(uuid4())
+        session = WhisperSession(
+            session_id=session_id,
+            model=self,
+            language=language,
+            sample_rate=sample_rate,
+            verbose=verbose
+        )
+        
+        if verbose:
+            logger.info(f"Created StableWhisper transcription session: {session_id}")
+        
+        return session
+
+    def transcribe_core(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Dict[str, Any],
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Generator[Segment, None, None]:
+        """
+        Transcribe using stable-whisper engine.
+        """
+        # Handle URL download or blob processing if needed
+        audio_path = utils.get_audio_file_path(path=path, url=url, blob=blob, verbose=verbose)
+
+        if verbose:
+            logger.info(f"Using stable-whisper engine with model: {self.model}")
+            logger.info(f"Processing file: {audio_path}")
+            if self.model_object:
+                logger.info(f"Using pre-loaded model: {self.model_object}")
+            if diarize:
+                logger.info("Diarization is enabled")
+
+        try:
+            # Adapt the unified on_progress contract to stable-whisperless's
+            # native (seek_seconds, total_duration_seconds) progress_callback.
+            # We pass this wrapper unconditionally; emit_progress is a no-op
+            # when on_progress is None.
+            def _stable_whisper_progress(seek: float, total: float) -> None:
+                emit_progress(
+                    on_progress,
+                    phase="transcription",
+                    step="decode",
+                    step_fraction=seek / total if total else 0.0,
+                    description="Transcribing audio",
+                    processed_seconds=float(seek),
+                    total_seconds=float(total),
+                )
+
+            # Determine whether diarization can run concurrently with
+            # transcription. Only the pyannote engine's pipeline run is
+            # independent of transcription_segments; the ivrit engine
+            # requires transcription_segments as input and must run after.
+            diar_kwargs = (diarization_args or {}).copy() if diarize else {}
+            diar_engine = diar_kwargs.get("engine", "ivrit") if diarize else None
+            run_pyannote_concurrently = diarize and diar_engine == "pyannote"
+
+            pyannote_future = None
+            executor = None
+
+            if run_pyannote_concurrently:
+                from .diarization import PyannoteDiarizationEngine
+
+                pyannote_engine = PyannoteDiarizationEngine()
+                diar_kwargs.setdefault("device", self.device)
+
+                # Load audio once up front so both the pyannote pipeline and
+                # (if needed) Whisper can use it without redundant decoding.
+                audio_waveform = utils.load_audio(audio_path)
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                pyannote_future = executor.submit(
+                    pyannote_engine.run_pipeline,
+                    audio_waveform,
+                    device=diar_kwargs.get("device"),
+                    checkpoint_path=diar_kwargs.get("checkpoint_path"),
+                    num_speakers=diar_kwargs.get("num_speakers"),
+                    min_speakers=diar_kwargs.get("min_speakers"),
+                    max_speakers=diar_kwargs.get("max_speakers"),
+                    use_auth_token=diar_kwargs.get("use_auth_token"),
+                    verbose=verbose,
+                    on_progress=on_progress,
+                )
+
+            try:
+                # Transcribe using stable-whisper with word timestamps
+                # Enable word timestamps if requested
+                #
+                # If audio_waveform was already loaded above (16kHz mono
+                # np.ndarray, for the concurrent pyannote pipeline), reuse it
+                # here to avoid a second ffmpeg decode of the same file.
+                # stable-whisper's transcribe() accepts
+                # Union[str, np.ndarray, torch.Tensor, bytes, AudioLoader],
+                # and numpy/torch inputs are required to already be at 16kHz
+                # (utils.load_audio uses utils.SAMPLE_RATE == 16000), so this
+                # is a drop-in compatible substitution for the path string.
+                transcribe_input = audio_waveform if run_pyannote_concurrently else audio_path
+
+                result = self.model_object.transcribe(
+                    transcribe_input,
+                    language=language,
+                    word_timestamps=output_options['word_timestamps'],
+                    progress_callback=_stable_whisper_progress,
+                )
+                segments = result.segments
+
+                # Collect segments for diarization if needed
+                all_segments = [] if diarize else None
+
+                for segment in segments:
+                    # Build extra_data dictionary if requested
+                    segment_extra_data = _copy_segment_extra_data(segment, language=language) if output_options['extra_data'] else {}
+
+                    # Process words if available and requested
+                    segment_words = []
+                    if output_options['word_timestamps'] and hasattr(segment, 'words') and segment.words:
+                        for word_data in segment.words:
+                            word = Word(
+                                word=word_data.word,
+                                start=word_data.start,
+                                end=word_data.end,
+                                probability=getattr(word_data, 'probability', None)
+                            )
+                            segment_words.append(word)
+
+                    # Create Segment object
+                    segment_obj = Segment(
+                        text=segment.text,
+                        start=segment.start,
+                        end=segment.end,
+                        words=segment_words,
+                        extra_data=segment_extra_data
+                    )
+
+                    if diarize:
+                        all_segments.append(segment_obj)
+                    else:
+                        yield segment_obj
+
+                # Apply diarization if requested
+                if diarize:
+                    if run_pyannote_concurrently:
+                        # Wait for the concurrently-running pyannote pipeline
+                        # and merge its results into the transcription segments.
+                        diarization_df = pyannote_future.result()
+                        all_segments = pyannote_engine.assign_speakers(diarization_df, all_segments)
+                    else:
+                        from .diarization import diarize as diarize_func
+
+                        # Copy user diarization arguments and set defaults
+                        diar_kwargs.setdefault("engine", "ivrit")
+                        diar_kwargs.setdefault("device", self.device)
+
+                        all_segments = diarize_func(
+                            audio=audio_path,
+                            transcription_segments=all_segments,
+                            verbose=verbose,
+                            on_progress=on_progress,
+                            **diar_kwargs
+                        )
+
+                    # Yield all segments
+                    for segment in all_segments:
+                        yield segment
+
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True)
+
+        except Exception as e:
+            logger.error(f"Error during transcription: {e}")
+            raise
+
+        finally:
+            # Clean up temporary files created for URL downloads or blob processing
+            if (url is not None or blob is not None) and os.path.exists(audio_path):
+                os.remove(audio_path)
+
+
+class WhisperCppModel(TranscriptionModel):
+    """whisper.cpp transcription model via pywhispercpp"""
+    
+    def __init__(self, model: str, n_threads: int = None, **kwargs):
+        """
+        Initialize a whisper.cpp model.
+        
+        Args:
+            model: Model name (e.g., 'base', 'small', 'medium', 'large') or path to a .bin model file
+            n_threads: Number of threads to use for transcription (default: auto-detect)
+            **kwargs: Additional arguments passed to pywhispercpp Model constructor
+        """
+        super().__init__(engine="whisper-cpp", model=model)
+        
+        # Check for required dependencies
+        utils.check_dependencies(['pywhispercpp.model'], 'WhisperCppModel')
+        
+        self.model_path = model
+        self.n_threads = n_threads
+        self.model_kwargs = kwargs
+        
+        # Load the model immediately
+        self.model_object = self._load_whisper_cpp_model()
+    
+    def _load_whisper_cpp_model(self) -> Any:
+        """
+        Load the actual whisper.cpp model via pywhispercpp.
+        """
+        from pywhispercpp.model import Model
+        
+        logger.info(f'Loading whisper.cpp model: {self.model_path}')
+        
+        args = {}
+        if self.n_threads is not None:
+            args['n_threads'] = self.n_threads
+       
+        # Use beam-search by default.
+        # User can override this via model_kwargs. 
+        args['params_sampling_strategy'] = 1
+
+        # Add any additional kwargs passed to the constructor
+        args.update(self.model_kwargs)
+        
+        return Model(self.model_path, **args)
+    
+    def create_session(self, language: Optional[str] = None, sample_rate: int = 16000, 
+                      verbose: bool = False) -> TranscriptionSession:
+        """
+        Create a new transcription session for incremental audio processing.
+        
+        Args:
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            sample_rate: Audio sample rate (default: 16000 Hz)
+            verbose: Whether to enable verbose output
+            
+        Returns:
+            WhisperSession object for incremental transcription
+        """
+        session_id = str(uuid4())
+        session = WhisperSession(
+            session_id=session_id,
+            model=self,
+            language=language,
+            sample_rate=sample_rate,
+            verbose=verbose
+        )
+        
+        if verbose:
+            logger.info(f"Created WhisperCpp transcription session: {session_id}")
+        
+        return session
+
+    def transcribe_core(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Dict[str, Any] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Generator[Segment, None, None]:
+        """
+        Transcribe using whisper.cpp engine via pywhispercpp.
+        """
+        # Default output_options if not provided
+        if output_options is None:
+            output_options = {'word_timestamps': True, 'extra_data': True}
+
+        # Validate diarization support
+        if diarize:
+            raise NotImplementedError("Diarization (diarize=True) is not supported with whisper.cpp engine. "
+                                    "Please use StableWhisperModel or RunPodModel with core_engine='stable-whisper'.")
+
+        # Handle URL download or blob processing if needed
+        audio_path = utils.get_audio_file_path(path=path, url=url, blob=blob, verbose=verbose)
+
+        if verbose:
+            logger.info(f"Using whisper.cpp engine with model: {self.model}")
+            logger.info(f"Processing file: {audio_path}")
+
+        try:
+            # Build transcribe arguments
+            transcribe_args = {}
+            if language is not None:
+                transcribe_args['language'] = language
+
+            # Add any extra kwargs
+            transcribe_args.update(kwargs)
+
+            # Adapt the unified on_progress contract to pywhispercpp's
+            # new_segment_callback. pywhispercpp passes a Segment namedtuple
+            # with t0/t1 in centiseconds. Probe duration via ffmpeg so we
+            # can report a meaningful step_fraction.
+            if on_progress is not None:
+                total_seconds = utils.get_audio_duration(audio_path)
+                def _whisper_cpp_segment(segment) -> None:
+                    processed = segment.t1 / 100.0
+                    emit_progress(
+                        on_progress,
+                        phase="transcription",
+                        step="decode",
+                        step_fraction=processed / total_seconds if total_seconds else 0.0,
+                        description="Transcribing audio",
+                        processed_seconds=processed,
+                        total_seconds=total_seconds,
+                    )
+                transcribe_args["new_segment_callback"] = _whisper_cpp_segment
+
+            # Transcribe using pywhispercpp
+            # Returns list of Segment namedtuples with t0, t1 (centiseconds), text
+            segments = self.model_object.transcribe(audio_path, **transcribe_args)
+            
+            for segment in segments:
+                # Convert centiseconds to seconds
+                # pywhispercpp uses t0/t1 in centiseconds (1/100th of a second)
+                start_time = segment.t0 / 100.0
+                end_time = segment.t1 / 100.0
+                
+                # Build extra_data dictionary if requested
+                segment_extra_data = {}
+                if output_options.get('extra_data', True):
+                    if language:
+                        segment_extra_data['language'] = language
+                
+                # Create Segment object
+                # Note: pywhispercpp doesn't provide word-level timestamps in basic API
+                segment_obj = Segment(
+                    text=segment.text,
+                    start=start_time,
+                    end=end_time,
+                    words=[],
+                    extra_data=segment_extra_data
+                )
+                
+                yield segment_obj
+                
+        except Exception as e:
+            logger.error(f"Error during transcription: {e}")
+            raise
+
+        finally:
+            # Clean up temporary files created for URL downloads or blob processing
+            if (url is not None or blob is not None) and os.path.exists(audio_path):
+                os.remove(audio_path)
+
+
+class RunPodJob:
+    def __init__(self, api_key: str, endpoint_id: str, payload: dict):
+        self.api_key = api_key
+        self.endpoint_id = endpoint_id
+        self.base_url = f"https://api.runpod.ai/v2/{endpoint_id}"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        self.job_id = None
+
+        logger.debug(f"RunPodJob: POST {self.base_url}/run")
+        t0 = time.monotonic()
+        response = requests.post(
+            f"{self.base_url}/run",
+            headers=self.headers,
+            json=payload,
+        )
+        logger.debug(f"RunPodJob: submit returned status={response.status_code} in {time.monotonic()-t0:.2f}s")
+
+        if response.status_code == 401:
+            logger.error("RunPod API authentication failed: invalid API key")
+            raise Exception("Invalid RunPod API key")
+
+        if not response.ok:
+            logger.error(f"RunPod job submission failed: HTTP {response.status_code} {response.reason}")
+        response.raise_for_status()
+
+        result = response.json()
+        self.job_id = result.get("id")
+        logger.debug(f"RunPodJob[{self.job_id}]: submitted")
+
+    def status(self):
+        """Get job status"""
+        logger.debug(f"RunPodJob[{self.job_id}]: GET /status")
+        t0 = time.monotonic()
+        response = requests.get(
+            f"{self.base_url}/status/{self.job_id}",
+            headers=self.headers,
+        )
+        logger.debug(f"RunPodJob[{self.job_id}]: status HTTP {response.status_code} in {time.monotonic()-t0:.2f}s")
+        response.raise_for_status()
+
+        status_response = response.json()
+        job_status = status_response.get("status", "UNKNOWN")
+        logger.debug(f"RunPodJob[{self.job_id}]: status={job_status}")
+        return job_status
+
+    def stream(self):
+        """Stream job results"""
+        iter_n = 0
+        while True:
+            iter_n += 1
+            logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} GET /stream")
+            t0 = time.monotonic()
+            response = requests.get(
+                f"{self.base_url}/stream/{self.job_id}",
+                headers=self.headers,
+                stream=True,
+            )
+            logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} headers HTTP {response.status_code} in {time.monotonic()-t0:.2f}s")
+            response.raise_for_status()
+
+            # Expect a single response
+            try:
+                t1 = time.monotonic()
+                raw = response.content
+                logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} body read bytes={len(raw)} in {time.monotonic()-t1:.2f}s")
+                content = raw.decode('utf-8')
+                data = json.loads(content)
+                job_status = data['status']
+                stream_block = data.get('stream', []) or []
+                logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} parsed job_status={job_status} stream_items={len(stream_block)}")
+
+                if job_status not in ['IN_PROGRESS', 'COMPLETED']:
+                    logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} non-progress status={job_status}, breaking")
+                    break
+
+                yielded_segments = 0
+                yielded_progress = 0
+                for item in data['stream']:
+                    if 'output' in item:
+                        for entry in item['output']:
+                            if entry['type'] == 'segments':
+                                for element in entry['data']:
+                                    try:
+                                        yield Segment(**element)
+                                        yielded_segments += 1
+                                    except Exception as e:
+                                        logger.error(f"Failed to decode RunPod stream element: {e}")
+                                        raise Exception(f"Failed to decode JSON: {e}")
+                            elif entry['type'] == 'progress':
+                                yield {"progress": entry['data']}
+                                yielded_progress += 1
+
+                logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} yielded segments={yielded_segments} progress={yielded_progress}")
+
+                if data['status'] == 'COMPLETED':
+                    logger.debug(f"RunPodJob[{self.job_id}]: stream COMPLETED after iter={iter_n}")
+                    return
+
+            except json.JSONDecodeError as e:
+                logger.error(f"RunPodJob[{self.job_id}]: failed to parse stream JSON: {e}")
+                return
+
+    def cancel(self):
+        """Cancel the job"""
+        logger.debug(f"RunPodJob[{self.job_id}]: POST /cancel")
+        t0 = time.monotonic()
+        response = requests.post(
+            f"{self.base_url}/cancel/{self.job_id}",
+            headers=self.headers,
+        )
+        logger.debug(f"RunPodJob[{self.job_id}]: cancel HTTP {response.status_code} in {time.monotonic()-t0:.2f}s")
+        response.raise_for_status()
+
+        return response.json()
+
+    def get_timings(self):
+        """Fetch RunPod billing timings (delayTime/executionTime, in ms) from /status."""
+        response = requests.get(
+            f"{self.base_url}/status/{self.job_id}",
+            headers=self.headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "queue_ms": data.get("delayTime"),
+            "execution_ms": data.get("executionTime"),
+        }
+
+
+class AsyncRunPodJob:
+    """Async version of RunPodJob for better scalability with high concurrency."""
+    
+    def __init__(self, api_key: str, endpoint_id: str, payload: dict):
+        self.api_key = api_key
+        self.endpoint_id = endpoint_id
+        self.base_url = f"https://api.runpod.ai/v2/{endpoint_id}"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        self.payload = payload
+        self.job_id = None
+
+    async def submit(self):
+        """Submit the job asynchronously"""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/run",
+                headers=self.headers,
+                json=self.payload
+            ) as response:
+                if response.status == 401:
+                    logger.error("RunPod API authentication failed: invalid API key")
+                    raise Exception("Invalid RunPod API key")
+
+                if response.status >= 400:
+                    logger.error(f"RunPod async job submission failed: HTTP {response.status}")
+                response.raise_for_status()
+                result = await response.json()
+                self.job_id = result.get("id")
+                logger.debug(f"AsyncRunPodJob[{self.job_id}]: submitted")
+
+    async def status(self):
+        """Get job status asynchronously"""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.base_url}/status/{self.job_id}",
+                headers=self.headers
+            ) as response:
+                response.raise_for_status()
+                status_response = await response.json()
+                return status_response.get("status", "UNKNOWN")
+
+    async def stream(self):
+        """Stream job results asynchronously"""
+        while True:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.base_url}/stream/{self.job_id}",
+                    headers=self.headers
+                ) as response:
+                    response.raise_for_status()
+                    
+                    # Expect a single response
+                    try:
+                        content = await response.text()
+                        data = json.loads(content)
+                        if data['status'] not in ['IN_PROGRESS', 'COMPLETED']:
+                            break
+
+                        for item in data['stream']:
+                            if 'output' in item:
+                                for entry in item['output']:
+                                    if entry['type'] == 'segments':
+                                        for element in entry['data']:
+                                            try:
+                                                yield Segment(**element)
+                                            except Exception as e:
+                                                logger.error(f"Failed to decode RunPod async stream element: {e}")
+                                                raise Exception(f"Failed to decode JSON: {e}")
+                                    elif entry['type'] == 'progress':
+                                        yield {"progress": entry['data']}
+
+                        if data['status'] == 'COMPLETED':
+                            return
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse RunPod async JSON response: {e}")
+                        return
+
+    async def cancel(self):
+        """Cancel the job asynchronously"""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/cancel/{self.job_id}",
+                headers=self.headers
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    async def get_timings(self):
+        """Fetch RunPod billing timings (delayTime/executionTime, in ms) from /status."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.base_url}/status/{self.job_id}",
+                headers=self.headers
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return {
+                    "queue_ms": data.get("delayTime"),
+                    "execution_ms": data.get("executionTime"),
+                }
+
+
+class RunPodModel(TranscriptionModel):
+    """RunPod transcription model"""
+    
+    def __init__(self, model: str, api_key: str, endpoint_id: str, core_engine: str = "faster-whisper"):
+        super().__init__(engine="runpod", model=model)
+        
+        self.api_key = api_key
+        self.endpoint_id = endpoint_id
+        
+        # Validate core engine
+        if core_engine not in ["faster-whisper", "stable-whisper"]:
+            raise ValueError(f"Unsupported core engine: {core_engine}. Supported engines: 'faster-whisper', 'stable-whisper'")
+        
+        self.core_engine = core_engine
+        
+        # Constants for RunPod
+        self.IN_QUEUE_TIMEOUT = 300
+        self.MAX_STREAM_TIMEOUTS = 5
+        self.RUNPOD_MAX_PAYLOAD_LEN = 10 * 1024 * 1024
+    
+    def create_session(self, language: Optional[str] = None, sample_rate: int = 16000, 
+                      verbose: bool = False) -> TranscriptionSession:
+        """
+        Create a new transcription session for incremental audio processing.
+        
+        Note: RunPod sessions have limited functionality since they rely on remote API calls.
+        The session will accumulate audio but cannot perform true incremental transcription
+        until flush() is called.
+        
+        Args:
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            sample_rate: Audio sample rate (default: 16000 Hz)
+            verbose: Whether to enable verbose output
+            
+        Returns:
+            WhisperSession object for incremental transcription
+        """
+        session_id = str(uuid4())
+        session = WhisperSession(
+            session_id=session_id,
+            model=self,
+            language=language,
+            sample_rate=sample_rate,
+            verbose=verbose
+        )
+        
+        if verbose:
+            logger.info(f"Created RunPod transcription session: {session_id}")
+            logger.info("Note: RunPod sessions buffer audio locally and transcribe on flush()")
+        
+        return session
+
+    def transcribe_core(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Dict[str, Any],
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Generator[Segment, None, None]:
+        """
+        Transcribe using RunPod engine.
+        """
+        # Validate diarization support
+        if diarize and self.core_engine != "stable-whisper":
+            raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
+                                    f"Current core_engine is '{self.core_engine}'.")
+
+        # Determine payload type and data
+        if path is not None:
+            payload_type = "blob"
+            data_source = path
+        elif url is not None:
+            payload_type = "url"
+            data_source = url
+        elif blob is not None:
+            payload_type = "blob"
+            data_source = blob
+        else:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+        
+        if verbose:
+            logger.info(f"Using RunPod engine with model: {self.model}")
+            logger.info(f"Payload type: {payload_type}")
+            logger.info(f"Data source: {data_source}")
+        
+        # Prepare payload
+        payload = {
+            "input": {
+                "type": payload_type,
+                "model": self.model,
+                "engine": self.core_engine,
+                "streaming": True,
+                "transcribe_args": {
+                    "language": language,
+                    "diarize": diarize,
+                    "diarization_args": diarization_args,
+                    "output_options": output_options,
+                    "verbose": verbose,
+                    **kwargs
+                }
+            }
+        }
+        
+        if payload_type == "blob":
+            if path is not None:
+                # Read audio file and encode as base64
+                try:
+                    with open(data_source, 'rb') as f:
+                        audio_data = f.read()
+                    payload["input"]["transcribe_args"]["blob"] = base64.b64encode(audio_data).decode('utf-8')
+                except Exception as e:
+                    logger.error(f"Failed to read audio file for RunPod: {e}")
+                    raise Exception(f"Failed to read audio file: {e}")
+            else:
+                # Use blob data directly
+                payload["input"]["transcribe_args"]["blob"] = data_source
+        else:
+            payload["input"]["transcribe_args"]["url"] = data_source
+
+        # Check payload size
+        if len(str(payload)) > self.RUNPOD_MAX_PAYLOAD_LEN:
+            logger.error(f"RunPod payload too large: {len(str(payload))} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
+            raise ValueError(f"Payload length is {len(str(payload))}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
+
+        # Create and execute RunPod job
+        run_request = RunPodJob(self.api_key, self.endpoint_id, payload)
+        
+        # Wait for task to be queued
+        if verbose:
+            logger.info("Waiting for task to be queued...")
+        
+        status = None
+        for i in range(self.IN_QUEUE_TIMEOUT):
+            status = run_request.status()
+            if status == "IN_QUEUE":
+                emit_progress(
+                    on_progress,
+                    phase="transcription",
+                    step="queue",
+                    step_fraction=0.0,
+                    description="Waiting for GPU worker",
+                    queue_seconds=i,
+                )
+                time.sleep(1)
+                continue
+            break
+        if verbose:
+            logger.info(f"Task status: {status}")
+
+        if status == "IN_QUEUE":
+            emit_progress(
+                on_progress,
+                phase="transcription",
+                step="queue",
+                step_fraction=0.0,
+                description="Timed out waiting for GPU worker",
+            )
+            run_request.cancel()
+            run_request = None
+            raise TimeoutError("Transcription failed: timed out waiting for GPU worker")
+        if status not in ("IN_PROGRESS", "COMPLETED"):
+            emit_progress(
+                on_progress,
+                phase="transcription",
+                step="queue",
+                step_fraction=0.0,
+                description=f"Unexpected job status: {status}",
+            )
+            run_request.cancel()
+            run_request = None
+            raise Exception(f"Transcription failed: unexpected job status '{status}'")
+
+        # Collect streaming results
+        timeouts = 0
+        loop_iter = 0
+        job_id = run_request.job_id
+        while True:
+            loop_iter += 1
+            logger.debug(f"transcribe_core[{job_id}]: stream loop iter={loop_iter} timeouts={timeouts}")
+            try:
+                seg_count = 0
+                prog_count = 0
+                for stream_item in run_request.stream():
+                    if isinstance(stream_item, Segment):
+                        seg_count += 1
+                        yield stream_item
+                    elif isinstance(stream_item, dict) and "progress" in stream_item:
+                        # Worker-emitted progress dict; pass through
+                        # unchanged. The worker is responsible for following
+                        # the on_progress contract; we only log a warning if
+                        # the dict obviously violates it (no 'phase').
+                        worker_progress = stream_item["progress"]
+                        if "phase" not in worker_progress:
+                            logger.warning(
+                                "RunPod worker progress event missing 'phase' key: %s",
+                                worker_progress,
+                            )
+                        invoke_progress(on_progress, worker_progress)
+                        prog_count += 1
+                    else:
+                        raise Exception(f"RunPod error: {stream_item}")
+
+                # If we get here, streaming is complete
+                logger.debug(f"transcribe_core[{job_id}]: stream() returned cleanly iter={loop_iter} segments={seg_count} progress={prog_count}")
+
+                # Log RunPod billing timings (authoritative — same fields RunPod bills on)
+                try:
+                    timings = run_request.get_timings()
+                    logger.debug(
+                        f"RunPod[{job_id}] billing: queue={timings['queue_ms']}ms execution={timings['execution_ms']}ms"
+                    )
+                except Exception as e:
+                    logger.warning(f"RunPod[{job_id}]: failed to fetch billing timings: {e}")
+
+                run_request = None
+                break
+
+            except requests.exceptions.ReadTimeout:
+                timeouts += 1
+                if timeouts > self.MAX_STREAM_TIMEOUTS:
+                    logger.error(f"RunPod stream timeouts exceeded maximum ({self.MAX_STREAM_TIMEOUTS})")
+                    raise Exception(f"Number of request.stream() timeouts exceeded the maximum ({self.MAX_STREAM_TIMEOUTS})")
+                logger.warning(f"RunPod stream timeout {timeouts}/{self.MAX_STREAM_TIMEOUTS}, retrying...")
+                continue
+
+            except Exception as e:
+                logger.error(f"Exception during RunPod streaming: {e}")
+                run_request.cancel()
+                run_request = None
+                raise Exception(f"Exception during RunPod streaming: {e}")
+
+            finally:
+                if run_request:
+                    run_request.cancel()
+
+    async def transcribe_async(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> AsyncGenerator[Segment, None]:
+        """
+        Transcribe audio using RunPod asynchronously with native async I/O.
+
+        This specialized implementation uses aiohttp for better scalability
+        when handling many concurrent requests, avoiding thread pool exhaustion.
+
+        Args:
+            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
+            url: URL to download and transcribe (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            diarize: Whether to enable speaker diarization
+            diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
+            output_options: Dictionary controlling output verbosity. Supported keys:
+                - word_timestamps (bool): Whether to populate word-level timestamps (default: True)
+                - extra_data (bool): Whether to populate extra metadata fields (default: True)
+            verbose: Whether to enable verbose output
+            on_progress: Optional progress callback. See TranscriptionModel.transcribe.
+            **kwargs: Additional keyword arguments for the transcription model.
+        Returns:
+            AsyncGenerator yielding transcription segments
+            
+        Raises:
+            ValueError: If multiple input sources are provided, or none is provided
+            FileNotFoundError: If the specified path doesn't exist
+            Exception: For other transcription errors
+        """
+        # Validate diarization support
+        if diarize and self.core_engine != "stable-whisper":
+            raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
+                                    f"Current core_engine is '{self.core_engine}'.")
+        
+        # Validate arguments
+        provided_args = [arg for arg in [path, url, blob] if arg is not None]
+        if len(provided_args) > 1:
+            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
+        
+        if len(provided_args) == 0:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        # Default output options if not provided
+        if output_options is None:
+            output_options = {}
+        
+        # Set defaults for output options
+        output_options = {
+            'word_timestamps': output_options.get('word_timestamps', True),
+            'extra_data': output_options.get('extra_data', True),
+        }
+
+        # Determine payload type and data
+        if path is not None:
+            payload_type = "blob"
+            data_source = path
+        elif url is not None:
+            payload_type = "url"
+            data_source = url
+        elif blob is not None:
+            payload_type = "blob"
+            data_source = blob
+        else:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+        
+        if verbose:
+            logger.info(f"Using RunPod engine with model: {self.model}")
+            logger.info(f"Payload type: {payload_type}")
+            logger.info(f"Data source: {data_source}")
+        
+        # Prepare payload
+        payload = {
+            "input": {
+                "type": payload_type,
+                "model": self.model,
+                "engine": self.core_engine,
+                "streaming": True,
+                "transcribe_args": {
+                    "language": language,
+                    "diarize": diarize,
+                    "diarization_args": diarization_args,
+                    "output_options": output_options,
+                    "verbose": verbose,
+                    **kwargs
+                }
+            }
+        }
+        
+        if payload_type == "blob":
+            if path is not None:
+                # Read audio file and encode as base64
+                try:
+                    with open(data_source, 'rb') as f:
+                        audio_data = f.read()
+                    payload["input"]["transcribe_args"]["blob"] = base64.b64encode(audio_data).decode('utf-8')
+                except Exception as e:
+                    logger.error(f"Failed to read audio file for RunPod async: {e}")
+                    raise Exception(f"Failed to read audio file: {e}")
+            else:
+                # Use blob data directly
+                payload["input"]["transcribe_args"]["blob"] = data_source
+        else:
+            payload["input"]["transcribe_args"]["url"] = data_source
+
+        # Check payload size
+        if len(str(payload)) > self.RUNPOD_MAX_PAYLOAD_LEN:
+            logger.error(f"RunPod payload too large: {len(str(payload))} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
+            raise ValueError(f"Payload length is {len(str(payload))}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
+
+        # Create and execute RunPod job using native async
+        run_request = AsyncRunPodJob(self.api_key, self.endpoint_id, payload)
+        
+        # Submit the job
+        await run_request.submit()
+        
+        # Wait for task to be queued
+        if verbose:
+            logger.info("Waiting for task to be queued...")
+        
+        status = None
+        for i in range(self.IN_QUEUE_TIMEOUT):
+            status = await run_request.status()
+            if status == "IN_QUEUE":
+                emit_progress(
+                    on_progress,
+                    phase="transcription",
+                    step="queue",
+                    step_fraction=0.0,
+                    description="Waiting for GPU worker",
+                    queue_seconds=i,
+                )
+                await asyncio.sleep(1)
+                continue
+            break
+        if verbose:
+            logger.info(f"Task status: {status}")
+
+        if status == "IN_QUEUE":
+            emit_progress(
+                on_progress,
+                phase="transcription",
+                step="queue",
+                step_fraction=0.0,
+                description="Timed out waiting for GPU worker",
+            )
+            await run_request.cancel()
+            run_request = None
+            raise TimeoutError("Transcription failed: timed out waiting for GPU worker")
+        if status not in ("IN_PROGRESS", "COMPLETED"):
+            emit_progress(
+                on_progress,
+                phase="transcription",
+                step="queue",
+                step_fraction=0.0,
+                description=f"Unexpected job status: {status}",
+            )
+            await run_request.cancel()
+            run_request = None
+            raise Exception(f"Transcription failed: unexpected job status '{status}'")
+
+        # Collect streaming results
+        timeouts = 0
+        while True:
+            try:
+                async for stream_item in run_request.stream():
+                    if isinstance(stream_item, Segment):
+                        yield stream_item
+                    elif isinstance(stream_item, dict) and "progress" in stream_item:
+                        # Worker-emitted progress dict; pass through
+                        # unchanged. The worker is responsible for following
+                        # the on_progress contract; we only log a warning if
+                        # the dict obviously violates it (no 'phase').
+                        worker_progress = stream_item["progress"]
+                        if "phase" not in worker_progress:
+                            logger.warning(
+                                "RunPod worker progress event missing 'phase' key: %s",
+                                worker_progress,
+                            )
+                        invoke_progress(on_progress, worker_progress)
+                    else:
+                        raise Exception(f"RunPod error: {stream_item}")
+
+                # If we get here, streaming is complete.
+                # Log RunPod billing timings (authoritative — same fields RunPod bills on).
+                try:
+                    timings = await run_request.get_timings()
+                    logger.debug(
+                        f"RunPod[{run_request.job_id}] billing: queue={timings['queue_ms']}ms execution={timings['execution_ms']}ms"
+                    )
+                except Exception as e:
+                    logger.warning(f"RunPod[{run_request.job_id}]: failed to fetch billing timings: {e}")
+
+                run_request = None
+                break
+            except aiohttp.ClientError as e:
+                timeouts += 1
+                if timeouts > self.MAX_STREAM_TIMEOUTS:
+                    logger.error(f"RunPod async stream timeouts exceeded maximum ({self.MAX_STREAM_TIMEOUTS})")
+                    raise Exception(f"Number of request.stream() timeouts exceeded the maximum ({self.MAX_STREAM_TIMEOUTS})")
+                logger.warning(f"RunPod async stream timeout {timeouts}/{self.MAX_STREAM_TIMEOUTS}, retrying...")
+                continue
+
+            except Exception as e:
+                logger.error(f"Exception during RunPod async streaming: {e}")
+                await run_request.cancel()
+                run_request = None
+                raise Exception(f"Exception during RunPod streaming: {e}")
+
+            finally:
+                if run_request:
+                    await run_request.cancel()
+
+
+def load_model(
+    *,
+    engine: str,
+    model: str,
+    **kwargs
+) -> TranscriptionModel:
+    """
+    Load a transcription model for the specified engine and model.
+    
+    Args:
+        engine: Transcription engine to use ('faster-whisper', 'stable-whisper', 'whisper-cpp', 'runpod')
+        model: Model name for the selected engine
+        **kwargs: Additional arguments for specific engines. Known arguments include:
+            - faster-whisper: device, local_files_only, compute_type, and any other arguments accepted by WhisperModel
+            - stable-whisper: device, local_files_only, compute_type, and any other arguments accepted by stable_whisper.load_faster_whisper
+            - whisper-cpp: n_threads, and any other arguments accepted by pywhispercpp.model.Model
+            - runpod: api_key (required), endpoint_id (required), core_engine
+                     
+            Any additional kwargs not recognized by the model wrapper will be passed directly
+            to the underlying model constructor (WhisperModel or stable_whisper.load_faster_whisper).
+        
+    Returns:
+        TranscriptionModel object that can be used for transcription
+        
+    Raises:
+        ValueError: If the engine is not supported or required parameters are missing
+        ImportError: If required dependencies are not installed
+    """
+    if engine == "faster-whisper":
+        return FasterWhisperModel(model=model, **kwargs)
+    elif engine == "stable-whisper":
+        return StableWhisperModel(model=model, **kwargs)
+    elif engine == "whisper-cpp":
+        return WhisperCppModel(model=model, **kwargs)
+    elif engine == "runpod":
+        return RunPodModel(model=model, **kwargs)
+    else:
+        raise ValueError(f"Unsupported engine: {engine}. Supported engines: 'faster-whisper', 'stable-whisper', 'whisper-cpp', 'runpod'")
