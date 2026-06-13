@@ -26,6 +26,75 @@ from .utils import ProgressCallback, emit_progress, invoke_progress
 logger = logging.getLogger(__name__)
 
 
+def _split_long_segments(
+    segments: List['Segment'],
+    max_duration: float = 2.0,
+    min_silence: float = 0.2,
+) -> List['Segment']:
+    """
+    Split segments longer than max_duration at silence gaps between words.
+
+    A silence gap is the pause between the end of one word and the start of
+    the next. When a gap >= min_silence is found inside a long segment, that
+    gap is used as a split point. The original word-level timestamps are
+    preserved exactly — no interpolation is done.
+
+    Args:
+        segments: List of Segment objects from the transcription model.
+        max_duration: Segments longer than this (seconds) are candidates for
+            splitting. Default 2.0 s matches the average segment length
+            produced by the automatic-language mode, which yields better
+            diarization.
+        min_silence: Minimum gap between words (seconds) to be used as a
+            split point. Default 0.2 s avoids splitting on natural
+            within-phrase pauses that are too short.
+
+    Returns:
+        New list of Segment objects. Segments that are short enough, or that
+        have no words, are returned unchanged.
+    """
+    result = []
+    for seg in segments:
+        duration = seg.end - seg.start
+
+        # No words available or segment is short enough — keep as-is
+        if not seg.words or duration <= max_duration:
+            result.append(seg)
+            continue
+
+        # Find split points: gaps between consecutive words >= min_silence
+        split_indices = []
+        for i in range(len(seg.words) - 1):
+            gap = seg.words[i + 1].start - seg.words[i].end
+            if gap >= min_silence:
+                split_indices.append(i + 1)  # index of first word in next chunk
+
+        # No suitable gap found — keep segment as-is
+        if not split_indices:
+            result.append(seg)
+            continue
+
+        # Build sub-segments from split points
+        chunk_starts = [0] + split_indices
+        chunk_ends = split_indices + [len(seg.words)]
+
+        for c_start, c_end in zip(chunk_starts, chunk_ends):
+            chunk_words = seg.words[c_start:c_end]
+            if not chunk_words:
+                continue
+            new_seg = Segment(
+                text=" ".join(w.word.strip() for w in chunk_words),
+                start=chunk_words[0].start,
+                end=chunk_words[-1].end,
+                words=chunk_words,
+                speakers=list(seg.speakers),      # will be overwritten by diarization
+                extra_data=dict(seg.extra_data),  # carry original metadata
+            )
+            result.append(new_seg)
+
+    return result
+
+
 def _copy_segment_extra_data(segment, language: Optional[str] = None) -> dict:
     """
     Copy extra data from a segment object, filtering out bound methods and other non-value attributes.
@@ -1041,6 +1110,13 @@ class StableWhisperModel(TranscriptionModel):
                 # Apply diarization if requested
                 if diarize:
                     if run_pyannote_concurrently:
+                        # Split long segments before mapping pyannote results
+                        # back to transcription segments. This improves speaker
+                        # assignment accuracy when the transcription model
+                        # produces long segments (e.g. when language is set
+                        # explicitly to Hebrew).
+                        all_segments = _split_long_segments(all_segments)
+
                         # Wait for the concurrently-running pyannote pipeline
                         # and merge its results into the transcription segments.
                         diarization_df = pyannote_future.result()
